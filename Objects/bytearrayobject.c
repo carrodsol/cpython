@@ -141,22 +141,26 @@ PyByteArray_FromStringAndSize(const char *bytes, Py_ssize_t size)
     }
 
     new = PyObject_New(PyByteArrayObject, &PyByteArray_Type);
-    if (new == NULL)
+    if (new == NULL) {
         return NULL;
+    }
 
     if (size == 0) {
+        new->ob_bytes_object = NULL;
         new->ob_bytes = NULL;
         alloc = 0;
     }
     else {
         alloc = size + 1;
-        new->ob_bytes = PyMem_Malloc(alloc);
+        new->ob_bytes_object = PyBytes_FromStringAndSize(NULL, alloc);
+        new->ob_bytes = PyBytes_AsString(new->ob_bytes_object);
         if (new->ob_bytes == NULL) {
             Py_DECREF(new);
             return PyErr_NoMemory();
         }
-        if (bytes != NULL && size > 0)
+        if (bytes != NULL && size > 0) {
             memcpy(new->ob_bytes, bytes, size);
+        }
         new->ob_bytes[size] = '\0';  /* Trailing null byte */
     }
     Py_SET_SIZE(new, size);
@@ -189,7 +193,6 @@ static int
 bytearray_resize_lock_held(PyObject *self, Py_ssize_t requested_size)
 {
     _Py_CRITICAL_SECTION_ASSERT_OBJECT_LOCKED(self);
-    void *sval;
     PyByteArrayObject *obj = ((PyByteArrayObject *)self);
     /* All computations are done unsigned to avoid integer overflows
        (see issue #22335). */
@@ -244,25 +247,28 @@ bytearray_resize_lock_held(PyObject *self, Py_ssize_t requested_size)
         return -1;
     }
 
+    /* re-align data to the start of the allocation. */
     if (logical_offset > 0) {
-        sval = PyMem_Malloc(alloc);
-        if (sval == NULL) {
-            PyErr_NoMemory();
+        memmove(obj->ob_bytes, obj->ob_start,
+                Py_MIN(requested_size, Py_SIZE(self)));
+    }
+
+    if (obj->ob_bytes_object == NULL) {
+        obj->ob_bytes_object = PyBytes_FromStringAndSize(NULL, alloc);
+        if (obj->ob_bytes_object == NULL) {
             return -1;
         }
-        memcpy(sval, PyByteArray_AS_STRING(self),
-               Py_MIN((size_t)requested_size, (size_t)Py_SIZE(self)));
-        PyMem_Free(obj->ob_bytes);
     }
     else {
-        sval = PyMem_Realloc(obj->ob_bytes, alloc);
-        if (sval == NULL) {
-            PyErr_NoMemory();
+        if (_PyBytes_Resize(&obj->ob_bytes_object, alloc) == -1) {
+            Py_SET_SIZE(self, 0);
+            obj->ob_bytes = obj->ob_start = NULL;
+            FT_ATOMIC_STORE_SSIZE_RELAXED(obj->ob_alloc, 0);
             return -1;
         }
     }
 
-    obj->ob_bytes = obj->ob_start = sval;
+    obj->ob_bytes = obj->ob_start = PyBytes_AS_STRING(obj->ob_bytes_object);
     Py_SET_SIZE(self, size);
     FT_ATOMIC_STORE_SSIZE_RELAXED(obj->ob_alloc, alloc);
     obj->ob_bytes[size] = '\0'; /* Trailing null byte */
@@ -1169,9 +1175,7 @@ bytearray_dealloc(PyObject *op)
                         "deallocated bytearray object has exported buffers");
         PyErr_Print();
     }
-    if (self->ob_bytes != 0) {
-        PyMem_Free(self->ob_bytes);
-    }
+    Py_CLEAR(self->ob_bytes_object);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -1488,6 +1492,95 @@ bytearray_resize_impl(PyByteArrayObject *self, Py_ssize_t size)
         memset(PyByteArray_AS_STRING(self) + start_size, 0, size - start_size);
     }
     Py_RETURN_NONE;
+}
+
+
+/*[clinic input]
+@critical_section
+bytearray.take_bytes
+    n: object = None
+        Bytes to take, negative indexes from end. None indicates all bytes.
+    /
+Take *n* bytes from the bytearray and return them as a bytes object.
+[clinic start generated code]*/
+
+static PyObject *
+bytearray_take_bytes_impl(PyByteArrayObject *self, PyObject *n)
+/*[clinic end generated code: output=3147fbc0bbbe8d94 input=b15b5172cdc6deda]*/
+{
+    Py_ssize_t to_take, original;
+    Py_ssize_t size = Py_SIZE(self);
+    if (Py_IsNone(n)) {
+        to_take = original = size;
+    }
+    // Integer index, from start (zero, positive) or end (negative).
+    else if (_PyIndex_Check(n)) {
+        to_take = original = PyNumber_AsSsize_t(n, PyExc_IndexError);
+        if (to_take == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (to_take < 0) {
+            to_take += size;
+        }
+    } else {
+        PyErr_SetString(PyExc_TypeError, "n must be an integer or None");
+        return NULL;
+    }
+
+    if (to_take < 0 || to_take > size) {
+        PyErr_Format(PyExc_IndexError,
+            "can't take %d(%d) outside size %d",
+            original, to_take, size);
+        return NULL;
+    }
+
+    // Exports may change the contents, No mutable bytes allowed.
+    if (!_canresize(self)) {
+        return NULL;
+    }
+
+    if (to_take == 0 || size == 0) {
+        return Py_GetConstant(Py_CONSTANT_EMPTY_BYTES);
+    }
+
+    // Copy remaining bytes to a new bytes.
+    PyObject *remaining = NULL;
+    Py_ssize_t remaining_length = size - to_take;
+    if (remaining_length > 0) {
+        // +1 to copy across the null which always ends a bytearray.
+        remaining = PyBytes_FromStringAndSize(self->ob_start + to_take,
+                                              remaining_length + 1);
+        if (remaining == NULL) {
+            return NULL;
+        }
+    }
+
+    // If the bytes are offset inside the buffer must first align.
+    if (self->ob_start != self->ob_bytes) {
+        memmove(self->ob_bytes, self->ob_start, to_take);
+        self->ob_start = self->ob_bytes;
+    }
+
+    if (_PyBytes_Resize(&self->ob_bytes_object, to_take) == -1) {
+        Py_CLEAR(remaining);
+        return NULL;
+    }
+
+    // Point the bytearray towards the buffer with the remaining data.
+    PyObject *result = self->ob_bytes_object;
+    self->ob_bytes_object = remaining;
+    if (remaining) {
+        self->ob_bytes = self->ob_start = PyBytes_AS_STRING(self->ob_bytes_object);
+        Py_SET_SIZE(self, size - to_take);
+        FT_ATOMIC_STORE_SSIZE_RELAXED(self->ob_alloc, size - to_take + 1);
+    }
+    else {
+        self->ob_bytes = self->ob_start = NULL;
+        Py_SET_SIZE(self, 0);
+        FT_ATOMIC_STORE_SSIZE_RELAXED(self->ob_alloc, 0);
+    }
+
+    return result;
 }
 
 
@@ -2686,6 +2779,7 @@ static PyMethodDef bytearray_methods[] = {
     BYTEARRAY_STARTSWITH_METHODDEF
     BYTEARRAY_STRIP_METHODDEF
     {"swapcase", bytearray_swapcase, METH_NOARGS, _Py_swapcase__doc__},
+    BYTEARRAY_TAKE_BYTES_METHODDEF
     {"title", bytearray_title, METH_NOARGS, _Py_title__doc__},
     BYTEARRAY_TRANSLATE_METHODDEF
     {"upper", bytearray_upper, METH_NOARGS, _Py_upper__doc__},
